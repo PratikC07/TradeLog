@@ -1,4 +1,3 @@
-
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func, case, desc, asc  
 from uuid import UUID
@@ -12,42 +11,76 @@ def get_user_analytics(current_user: TokenData, db: Session) -> models.UserAnaly
     user_uuid = UUID(current_user.user_id)
     
     # 1. Aggregate Math for User Analytics
+    # We use conditional sums (case) to calculate all metrics in a single DB query for performance
     query = db.query(
         func.count(Trade.id).label('total_trades'),
         func.sum(Trade.pnl).label('total_pnl'),
+        # Sum only positive PnL for Gross Profit
         func.sum(case((Trade.pnl > 0, Trade.pnl), else_=0)).label('gross_profit'),
+        # Sum only negative PnL for Gross Loss (result will be negative, e.g., -500)
         func.sum(case((Trade.pnl < 0, Trade.pnl), else_=0)).label('gross_loss'),
+        # Count number of winning trades
         func.sum(case((Trade.pnl > 0, 1), else_=0)).label('win_count'),
+        # Count number of losing trades
         func.sum(case((Trade.pnl < 0, 1), else_=0)).label('loss_count')
     ).filter(Trade.user_id == user_uuid, Trade.status == TradeStatus.CLOSED)
     
     result = query.first()
     
+    # 2. Count Active Positions (Open Trades) separately
     active_count = db.query(func.count(Trade.id)).filter(
         Trade.user_id == user_uuid, 
         Trade.status == TradeStatus.OPEN
     ).scalar() or 0
 
-    # Extract
+    # 3. Extract & Sanitize (Handle None if user has 0 trades)
     total_trades = result.total_trades or 0
     total_pnl = result.total_pnl or 0.0
     gross_profit = result.gross_profit or 0.0
+    # Use abs() to get the magnitude of loss (e.g., convert -500 to 500) for correct division
     gross_loss = abs(result.gross_loss or 0.0)
     wins = result.win_count or 0
     losses = result.loss_count or 0
 
-    # Derived Math
-    profit_factor = round(gross_profit / gross_loss, 2) if gross_loss > 0 else (99.99 if gross_profit > 0 else 0.0)
+    # 4. Derived Math Calculations
+    
+    # Profit Factor: Ratio of money won to money lost
+    if gross_loss > 0:
+        profit_factor = round(gross_profit / gross_loss, 2)
+    else:
+        # If no losses, profit factor is infinite. We use 99.99 as a cap if there is profit, else 0.
+        profit_factor = 99.99 if gross_profit > 0 else 0.0
+
+    # Win Rate: Percentage of trades that were profitable
     win_rate = round((wins / total_trades * 100), 1) if total_trades > 0 else 0.0
+    
+    # Avg Win: Average profit per winning trade
     avg_win = round(gross_profit / wins, 2) if wins > 0 else 0.0
+    
+    # Avg Loss: Average loss per losing trade
     avg_loss = round(gross_loss / losses, 2) if losses > 0 else 0.0
 
-    # Best Asset
-    best_asset_row = db.query(Trade.symbol, func.sum(Trade.pnl).label('total'))\
-        .filter(Trade.user_id == user_uuid, Trade.status == TradeStatus.CLOSED)\
-        .group_by(Trade.symbol).order_by(desc('total')).first()
+    # 5. Best Asset Logic
+    # Groups trades by symbol and sums PnL.
+    best_asset_query = db.query(
+        Trade.symbol, 
+        func.sum(Trade.pnl).label('total')
+    ).filter(
+        Trade.user_id == user_uuid, 
+        Trade.status == TradeStatus.CLOSED
+    ).group_by(Trade.symbol)
+    
+    # CRITICAL FIX: Ensure we only return a "Best Asset" if the total PnL is POSITIVE (> 0).
+    # This prevents showing a losing asset as your "best" just because it lost the least.
+    best_asset_row = best_asset_query.having(func.sum(Trade.pnl) > 0)\
+        .order_by(desc('total')).first()
         
-    best_asset = models.BestAsset(symbol=best_asset_row.symbol, total_pnl=round(best_asset_row.total, 2)) if best_asset_row else None
+    best_asset = None
+    if best_asset_row:
+        best_asset = models.BestAsset(
+            symbol=best_asset_row.symbol, 
+            total_pnl=round(best_asset_row.total, 2)
+        )
 
     return models.UserAnalyticsSummary(
         net_realized_pnl=round(total_pnl, 2),
@@ -61,21 +94,25 @@ def get_user_analytics(current_user: TokenData, db: Session) -> models.UserAnaly
     )
 
 def get_admin_analytics(db: Session) -> models.AdminAnalyticsSummary:
+    # Count users (excluding admins)
     total_users = db.query(User).filter(User.role != UserRole.ADMIN).count()
+    # Count all trades (open + closed)
     total_trades = db.query(Trade).count()
+    # Count currently open positions
     active_positions = db.query(Trade).filter(Trade.status == TradeStatus.OPEN).count()
+    # Sum PnL of ALL closed trades on the platform
     total_pnl = db.query(func.sum(Trade.pnl)).filter(Trade.status == TradeStatus.CLOSED).scalar() or 0.0
 
-    # Helper to find Outliers
-    def get_outlier(order_func, require_negative=False):
+    # Helper function to find Top Gainer / Top Loser
+    def get_outlier(order_func, require_positive=False):
         query = db.query(
             Trade.user_id, 
             func.sum(Trade.pnl).label('total')
         ).filter(Trade.status == TradeStatus.CLOSED).group_by(Trade.user_id)
         
-        
-        if require_negative:
-            query = query.having(func.sum(Trade.pnl) < 0)
+        # CRITICAL FIX: For Top Gainer, require sum(pnl) > 0
+        if require_positive:
+            query = query.having(func.sum(Trade.pnl) > 0)
 
         row = query.order_by(order_func('total')).first()
         
@@ -89,15 +126,22 @@ def get_admin_analytics(db: Session) -> models.AdminAnalyticsSummary:
                 )
         return None
 
+    top_gainer = get_outlier(desc, require_positive=True)
+    top_loser = get_outlier(asc, require_positive=False)
+
+    # CORRECTION: Logic to prevent the same user from appearing as both Gainer and Loser.
+    # If the Top Gainer and Top Loser are the same person (e.g., only 1 user has PnL),
+    # we hide the 'Loser' card to avoid confusion.
+    if top_gainer and top_loser and top_gainer.email == top_loser.email:
+        top_loser = None
+
     return models.AdminAnalyticsSummary(
         total_users=total_users,
         total_trades=total_trades,
         active_positions=active_positions,
         total_platform_pnl=round(total_pnl, 2),
-        # Top Gainer: Just highest number
-        top_gainer=get_outlier(desc, require_negative=False),
-        # Top Loser: Lowest number BUT must be negative
-        top_loser=get_outlier(asc, require_negative=True) 
+        top_gainer=top_gainer,
+        top_loser=top_loser
     )
 
 
@@ -125,7 +169,6 @@ def get_top_profitable_trades(db: Session) -> PaginatedTradeResponse:
         .filter(Trade.status == TradeStatus.CLOSED, Trade.pnl > 0)\
         .order_by(desc(Trade.pnl)).limit(5).all()
         
-    
     return {
         "data": trades, 
         "total": len(trades), 
